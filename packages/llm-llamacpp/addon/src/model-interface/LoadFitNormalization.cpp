@@ -1487,6 +1487,11 @@ NormalizedLoad normalizeLoadForFit(
   if (!params.tensor_buft_overrides.empty()) {
     params.tensor_buft_overrides.push_back({nullptr, nullptr});
   }
+  params.tensor_buft_overrides.resize(
+      std::max(
+          params.tensor_buft_overrides.size(),
+          llama_max_tensor_buft_overrides()),
+      {nullptr, nullptr});
 
   if (!params.chat_template.empty() &&
       !common_chat_verify_template(params.chat_template, params.use_jinja)) {

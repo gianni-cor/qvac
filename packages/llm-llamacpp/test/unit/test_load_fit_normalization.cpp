@@ -364,6 +364,24 @@ protected:
   }
 };
 
+TEST_F(
+    LoadFitNormalizationTest, PadsTensorBufferOverridesForFabricAutomaticFit) {
+  const auto result = lfn::normalizeLoadForFit(
+      "/tmp/model.gguf",
+      baseConfig(),
+      metadata_,
+      {},
+      backend({.type = backend_selection::GPU, .name = "none"}));
+
+  ASSERT_EQ(
+      result.params.tensor_buft_overrides.size(),
+      llama_max_tensor_buft_overrides());
+  for (const auto& override : result.params.tensor_buft_overrides) {
+    EXPECT_EQ(override.pattern, nullptr);
+    EXPECT_EQ(override.buft, nullptr);
+  }
+}
+
 TEST_F(LoadFitNormalizationTest, ExplicitContextAndMinimumClampAreCanonical) {
   auto config = baseConfig();
   config["ctx-size"] = "4";
