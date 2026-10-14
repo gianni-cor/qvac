@@ -1390,6 +1390,40 @@ TEST_F(BertModelTest, BackendWithSplitModeRejected) {
   }
 }
 
+TEST_F(BertModelTest, SetupParamsDefaultsCpuPollingToZero) {
+  const auto setup = setupParams(
+      getInvalidModelPath(), {{"device", "cpu"}});
+
+  EXPECT_EQ(setup.params.cpuparams.poll, 0U);
+  EXPECT_EQ(setup.params.cpuparams_batch.poll, 0U);
+}
+
+TEST_F(BertModelTest, SetupParamsExplicitPollOverridesBothDefaults) {
+  const auto setup = setupParams(
+      getInvalidModelPath(), {{"device", "cpu"}, {"poll", "50"}});
+
+  EXPECT_EQ(setup.params.cpuparams.poll, 50U);
+  EXPECT_EQ(setup.params.cpuparams_batch.poll, 50U);
+}
+
+TEST_F(BertModelTest, SetupParamsExplicitBatchPollOverridesPrimaryPoll) {
+  const auto setup = setupParams(
+      getInvalidModelPath(),
+      {{"device", "cpu"}, {"poll", "50"}, {"poll-batch", "1"}});
+
+  EXPECT_EQ(setup.params.cpuparams.poll, 50U);
+  EXPECT_EQ(setup.params.cpuparams_batch.poll, 1U);
+}
+
+TEST_F(BertModelTest, SetupParamsAcceptsBatchPollUnderscoreAlias) {
+  const auto setup = setupParams(
+      getInvalidModelPath(),
+      {{"device", "cpu"}, {"poll", "50"}, {"poll_batch", "1"}});
+
+  EXPECT_EQ(setup.params.cpuparams.poll, 50U);
+  EXPECT_EQ(setup.params.cpuparams_batch.poll, 1U);
+}
+
 TEST_F(BertModelTest, DeprecatedNoMmapAliasLoadsWithoutMmap) {
   if (!fs::exists(getValidModelPath())) {
     FAIL() << "Test model not found at: " << getValidModelPath();
