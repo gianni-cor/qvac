@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "model-interface/CacheCheckpointFile.hpp"
+#include "model-interface/CacheFileIndex.hpp"
 #include "model-interface/CacheLedger.hpp"
 #include "model-interface/SlotStateCache.hpp"
 #include "utils/SequenceStateSnapshot.hpp"
@@ -352,4 +353,123 @@ TEST_F(CacheCheckpointFileTest, FailedAppendCutsTheFileBackToTheState) {
   EXPECT_TRUE(
       cache::readCheckpointSection(path_, stateEnd(), resident(), policy())
           .empty());
+}
+
+namespace {
+
+class CacheFileIndexTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    dir_ =
+        fs::temp_directory_path() /
+        ("qvac_cache_file_index_" +
+         std::to_string(::testing::UnitTest::GetInstance()->random_seed()) +
+         "_" + ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    fs::create_directories(dir_);
+  }
+  void TearDown() override {
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+  }
+
+  // Writes a cacheKey file whose state is `tokens`, as the RAM tier does.
+  [[nodiscard]] std::string
+  write(const std::string& name, const std::vector<llama_token>& tokens) const {
+    using qvac_lib_inference_addon_llama::batching::SlotStateCache;
+    using qvac_lib_inference_addon_llama::batching::SlotStateCacheEntry;
+    SlotStateCacheEntry entry;
+    const auto count = static_cast<llama_pos>(tokens.size());
+    entry.ledgerWords =
+        cache::serialize(cache::fromTokens(tokens), count, count);
+    entry.state = std::vector<uint8_t>(16, 0x11);
+    const std::string path = (dir_ / name).string();
+    EXPECT_TRUE(SlotStateCache::writeStateFile(path, entry));
+    return path;
+  }
+
+  fs::path dir_;
+};
+
+} // namespace
+
+// Only files a request named are candidates, the longest shared prefix wins,
+// and the request's own file is left out.
+TEST_F(CacheFileIndexTest, FindsTheNotedFileWithTheLongestPrefix) {
+  cache::CacheFileIndex index;
+  const std::string shortFile = write("short.bin", {1, 2});
+  const std::string longFile = write("long.bin", {1, 2, 3, 7});
+  const std::string unnoted = write("unnoted.bin", {1, 2, 3, 4, 5});
+  index.note(shortFile);
+  index.note(longFile);
+  // Noted before it exists: skipped until it is written.
+  index.note((dir_ / "later.bin").string());
+
+  const cache::Ledger prompt = cache::fromTokens({1, 2, 3, 4, 5, 6});
+  auto match = index.longestPrefix(prompt, true, "");
+  ASSERT_TRUE(match.has_value());
+  EXPECT_EQ(match->path, longFile);
+  EXPECT_EQ(match->reusable, 3u);
+
+  match = index.longestPrefix(prompt, true, longFile);
+  ASSERT_TRUE(match.has_value());
+  EXPECT_EQ(match->path, shortFile);
+
+  // Untrimmable memory: only a state that is a prefix of the prompt serves.
+  match = index.longestPrefix(prompt, false, "");
+  ASSERT_TRUE(match.has_value());
+  EXPECT_EQ(match->path, shortFile);
+  EXPECT_EQ(match->reusable, 2u);
+
+  const std::string later = write("later.bin", {1, 2, 3, 4});
+  match = index.longestPrefix(prompt, true, "");
+  ASSERT_TRUE(match.has_value());
+  EXPECT_EQ(match->path, later);
+  EXPECT_EQ(match->reusable, 4u);
+  (void)unnoted;
+}
+
+// A rewritten file is read again, a deleted one stops being a candidate, and
+// its words are handed out only while the file is still the one read.
+TEST_F(CacheFileIndexTest, FollowsRewrittenAndDeletedFiles) {
+  cache::CacheFileIndex index;
+  const std::string path = write("conversation.bin", {1, 2, 3});
+  index.note(path);
+  const cache::Ledger prompt = cache::fromTokens({1, 2, 3, 4, 5});
+  ASSERT_EQ(index.longestPrefix(prompt, true, "")->reusable, 3u);
+
+  std::vector<llama_token> lent;
+  EXPECT_TRUE(index.use(path, [&](const std::vector<llama_token>& words) {
+    lent = words;
+    return true;
+  }));
+  EXPECT_EQ(cache::deserialize(lent.data(), lent.size()).nPast, 3);
+
+  (void)write("conversation.bin", {1, 2, 3, 4, 9, 9});
+  EXPECT_FALSE(index.use(path, [](const auto&) { return true; }))
+      << "the file changed since it was read";
+  ASSERT_EQ(index.longestPrefix(prompt, true, "")->reusable, 4u);
+
+  fs::remove(path);
+  EXPECT_FALSE(index.longestPrefix(prompt, true, "").has_value());
+  EXPECT_FALSE(index.use(path, [](const auto&) { return true; }));
+}
+
+// Files in another format share nothing, and the index stays bounded.
+TEST_F(CacheFileIndexTest, IgnoresForeignFilesAndStaysBounded) {
+  const std::string foreign = (dir_ / "foreign.bin").string();
+  {
+    std::ofstream out(foreign, std::ios::binary);
+    out << "not a cache file";
+  }
+  EXPECT_FALSE(cache::CacheFileIndex::readLedgerWords(foreign).has_value());
+
+  cache::CacheFileIndex index;
+  index.note(foreign);
+  EXPECT_FALSE(
+      index.longestPrefix(cache::fromTokens({1}), true, "").has_value());
+
+  for (size_t i = 0; i < cache::CacheFileIndex::MAX_FILES + 10; ++i) {
+    index.note((dir_ / ("k" + std::to_string(i))).string());
+  }
+  EXPECT_EQ(index.size(), cache::CacheFileIndex::MAX_FILES);
 }
