@@ -157,6 +157,18 @@ public:
   void setCacheReconciliationEnabled(bool enabled) override {
     cacheReconciliationEnabled_ = enabled;
   }
+  /// Every decoder-only text model: the ledger describes its memory exactly,
+  /// whichever request left it there. Encoder-decoder models encode each
+  /// prompt afresh.
+  [[nodiscard]] bool sharesCacheAcrossKeys() const override {
+    return !llama_model_has_encoder(modelCtx_.model);
+  }
+  void setCacheSourceProvider(
+      qvac_lib_inference_addon_llama::cache::CacheSourceProvider* provider)
+      override {
+    cacheSourceProvider_ = provider;
+  }
+  void resetStateKeepingMemory(bool resetStats) override;
   void setCacheCheckpointPolicy(
       const qvac_lib_inference_addon_llama::cache::CheckpointPolicy& policy)
       override {
@@ -249,6 +261,10 @@ public:
   void snapshotPreRequestCursor() override;
   void snapshotPreRequestRollbackAnchor() override;
 
+  /// Requests that started from another conversation's state.
+  [[nodiscard]] size_t donorAdoptionsForTesting() const noexcept {
+    return donorAdoptions_;
+  }
   /// Entries the last prompt reconciliation kept resident (0 = cold).
   [[nodiscard]] size_t lastCacheReuseForTesting() const noexcept {
     return lastCacheReuse_;
@@ -346,6 +362,17 @@ private:
       const std::vector<llama_token>& fullPrompt, bool isPrefillOnlyRequest);
   void rebuildSamplerFromLedger(
       const qvac_lib_inference_addon_llama::cache::Ledger& ledger);
+  /// Asks `cacheSourceProvider_` for a state that serves more of `prompt`
+  /// than this sequence does, and starts the request from a copy of it.
+  void adoptBestCacheSource(
+      const qvac_lib_inference_addon_llama::cache::Ledger& prompt);
+  /// Replaces this sequence's state with a copy of `donor`, cut back to a
+  /// checkpoint within the prefix it shares with `prompt` when the memory
+  /// cannot be trimmed there. False, with the sequence cleared, when the
+  /// copy cannot be used.
+  bool adoptDonorState(
+      const qvac_lib_inference_addon_llama::cache::DonorState& donor,
+      const qvac_lib_inference_addon_llama::cache::Ledger& prompt);
   void commitCacheRequest();
   bool restorePreRequestCacheState();
   // Checks a state `loadCache` or `adoptResidentState` just put in memory
@@ -478,6 +505,9 @@ private:
   // 0 when this request takes no end-of-history checkpoint.
   size_t historyCheckpointEntries_ = 0;
   size_t lastCacheReuse_ = 0;
+  size_t donorAdoptions_ = 0;
+  qvac_lib_inference_addon_llama::cache::CacheSourceProvider*
+      cacheSourceProvider_ = nullptr;
   size_t fileCheckpointReads_ = 0;
   qvac_lib_inference_addon_llama::cache::CheckpointPolicy
       cacheCheckpointPolicy_;
