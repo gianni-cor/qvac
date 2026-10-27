@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <list>
 #include <mutex>
 #include <optional>
@@ -18,6 +19,7 @@
 #include "CacheCheckpointFile.hpp"
 #include "CacheLedger.hpp"
 #include "CacheManager.hpp"
+#include "CacheSourceSelection.hpp"
 #include "SpeculativeRuntime.hpp"
 #include "addon/LlmErrors.hpp"
 #include "inference-addon-cpp/Logger.hpp"
@@ -105,6 +107,30 @@ public:
       }
     }
     return std::nullopt;
+  }
+
+  /// The longest `cache::reusablePrefix` of `prompt` among the entries; 0 when
+  /// none shares one with it.
+  [[nodiscard]] size_t
+  longestPrefix(const cache::Ledger& prompt, bool trimmable) const {
+    std::scoped_lock lock(mutex_);
+    const auto best = longestPrefixLocked(prompt, trimmable);
+    return best.has_value() ? best->second : 0;
+  }
+
+  /// Hands `use` the entry with the longest `cache::reusablePrefix` of
+  /// `prompt` when it exceeds `minimum`, under the lock. The entry stays in
+  /// place: a request that starts from another conversation copies it. Returns
+  /// what `use` returned, or false when no entry qualified.
+  bool useLongestPrefix(
+      const cache::Ledger& prompt, bool trimmable, size_t minimum,
+      const std::function<bool(const SlotStateCacheEntry&)>& use) {
+    std::scoped_lock lock(mutex_);
+    const auto best = longestPrefixLocked(prompt, trimmable);
+    if (!best.has_value() || best->second <= minimum) {
+      return false;
+    }
+    return use(best->first->second);
   }
 
   /// Writes every dirty, non-ephemeral entry to its `cacheKey` file and marks
@@ -279,6 +305,32 @@ private:
     entries_.pop_front();
   }
 
+  using Entries = std::list<std::pair<std::string, SlotStateCacheEntry>>;
+
+  /// Newest first, so a tie goes to the most recent conversation. An entry
+  /// whose ledger does not decode shares nothing.
+  [[nodiscard]] std::optional<std::pair<Entries::const_iterator, size_t>>
+  longestPrefixLocked(const cache::Ledger& prompt, bool trimmable) const {
+    std::optional<std::pair<Entries::const_iterator, size_t>> best;
+    for (auto it = entries_.end(); it != entries_.begin();) {
+      --it;
+      const SlotStateCacheEntry& entry = it->second;
+      size_t reusable = 0;
+      try {
+        const cache::DecodedLedger decoded = cache::deserialize(
+            entry.ledgerWords.data(), entry.ledgerWords.size());
+        reusable = cache::reusablePrefix(
+            decoded.ledger, &entry.checkpoints, prompt, trimmable);
+      } catch (const std::exception&) {
+        continue;
+      }
+      if (reusable > 0 && (!best.has_value() || reusable > best->second)) {
+        best.emplace(it, reusable);
+      }
+    }
+    return best;
+  }
+
   void eraseLocked(const std::string& key) noexcept {
     entries_.remove_if([&](const auto& item) { return item.first == key; });
   }
@@ -292,7 +344,7 @@ private:
   }
 
   mutable std::mutex mutex_;
-  std::list<std::pair<std::string, SlotStateCacheEntry>> entries_;
+  Entries entries_;
   const uint64_t budget_;
 };
 

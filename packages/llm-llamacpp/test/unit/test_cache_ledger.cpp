@@ -1,11 +1,15 @@
 #include <deque>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "model-interface/CacheLedger.hpp"
+#include "model-interface/CacheSourceSelection.hpp"
+#include "model-interface/SlotStateCache.hpp"
 #include "utils/ModelMemoryPolicy.hpp"
 
 namespace cache = qvac_lib_inference_addon_llama::cache;
@@ -310,4 +314,96 @@ TEST(ModelMemoryPolicy, SlidingWindowCheckpointsAreBoundedByTheWindow) {
   EXPECT_EQ(utils::slidingWindowCheckpointCells(512), 512u);
   EXPECT_EQ(utils::slidingWindowCheckpointCells(0), 0u);
   EXPECT_EQ(utils::slidingWindowCheckpointCells(-1), 0u);
+}
+
+namespace {
+cache::Checkpoint checkpointOver(std::vector<llama_token> tokens) {
+  cache::Checkpoint checkpoint;
+  checkpoint.ledger = cache::fromTokens(tokens);
+  return checkpoint;
+}
+} // namespace
+
+// Trimmable memory serves the whole shared prefix, wherever it diverges.
+TEST(CacheSourceSelection, TrimmableMemoryServesTheSharedPrefix) {
+  const cache::Ledger state = cache::fromTokens({1, 2, 3, 4, 5});
+  const cache::Ledger prompt = cache::fromTokens({1, 2, 3, 9});
+  EXPECT_EQ(cache::reusablePrefix(state, nullptr, prompt, true), 3u);
+  EXPECT_EQ(
+      cache::reusablePrefix(state, nullptr, cache::fromTokens({7}), true), 0u);
+}
+
+// Memory that cannot be trimmed serves a state that is a prefix of the
+// prompt whole, and a shorter shared prefix only through a checkpoint in it.
+TEST(CacheSourceSelection, UntrimmableMemoryNeedsAPrefixOrACheckpoint) {
+  const cache::Ledger state = cache::fromTokens({1, 2, 3, 4, 5});
+  EXPECT_EQ(
+      cache::reusablePrefix(
+          state, nullptr, cache::fromTokens({1, 2, 3, 4, 5, 6}), false),
+      5u);
+
+  const cache::Ledger diverging = cache::fromTokens({1, 2, 3, 9});
+  EXPECT_EQ(cache::reusablePrefix(state, nullptr, diverging, false), 0u);
+
+  cache::Checkpoints checkpoints;
+  checkpoints.push_back(checkpointOver({1}));
+  checkpoints.push_back(checkpointOver({1, 2}));
+  // Longer than the shared prefix: unusable.
+  checkpoints.push_back(checkpointOver({1, 2, 3, 4}));
+  // Not a prefix of the prompt: unusable.
+  checkpoints.push_back(checkpointOver({1, 5}));
+  EXPECT_EQ(cache::reusablePrefix(state, &checkpoints, diverging, false), 2u);
+}
+
+// The longest reusable prefix wins, the earliest (cheapest) one on a tie,
+// and only when it beats what the request already has.
+TEST(CacheSourceSelection, LongestReusableWinsAboveTheMinimum) {
+  const std::vector<size_t> reusable{4, 9, 9, 2};
+  EXPECT_EQ(cache::longestReusable(reusable, 0), std::optional<size_t>(1));
+  EXPECT_EQ(cache::longestReusable(reusable, 8), std::optional<size_t>(1));
+  EXPECT_EQ(cache::longestReusable(reusable, 9), std::nullopt);
+  EXPECT_EQ(cache::longestReusable(std::vector<size_t>{0, 0}, 0), std::nullopt);
+  EXPECT_EQ(cache::longestReusable({}, 0), std::nullopt);
+}
+
+// Another request starts from a copy of a RAM-tier entry: the lookup finds the
+// one that serves the most of its prompt, and every entry stays in the tier.
+TEST(CacheSourceSelection, RamTierLendsItsLongestPrefixWithoutGivingItUp) {
+  using qvac_lib_inference_addon_llama::batching::SlotStateCache;
+  using qvac_lib_inference_addon_llama::batching::SlotStateCacheEntry;
+  const auto entryOver = [](std::vector<llama_token> tokens) {
+    SlotStateCacheEntry entry;
+    entry.state.assign(16, 0);
+    const auto count = static_cast<llama_pos>(tokens.size());
+    entry.ledgerWords =
+        cache::serialize(cache::fromTokens(tokens), count, count);
+    return entry;
+  };
+  SlotStateCache tier(1 << 20);
+  ASSERT_TRUE(tier.insert("short", entryOver({1, 2})));
+  ASSERT_TRUE(tier.insert("long", entryOver({1, 2, 3, 4, 8})));
+  ASSERT_TRUE(tier.insert("other", entryOver({5, 6, 7})));
+  SlotStateCacheEntry broken = entryOver({1, 2, 3});
+  broken.ledgerWords.back() ^= 1;
+  ASSERT_TRUE(tier.insert("broken", std::move(broken)));
+
+  const cache::Ledger prompt = cache::fromTokens({1, 2, 3, 4, 9});
+  EXPECT_EQ(tier.longestPrefix(prompt, true), 4u);
+  // Without trimming only a state that is a prefix of the prompt serves.
+  EXPECT_EQ(tier.longestPrefix(prompt, false), 2u);
+
+  size_t lentEntries = 0;
+  EXPECT_TRUE(tier.useLongestPrefix(
+      prompt, true, 3, [&](const SlotStateCacheEntry& entry) {
+        lentEntries = cache::deserialize(
+                          entry.ledgerWords.data(), entry.ledgerWords.size())
+                          .ledger.entries.size();
+        return true;
+      }));
+  EXPECT_EQ(lentEntries, 5u);
+  EXPECT_FALSE(tier.useLongestPrefix(
+      prompt, true, 4, [](const SlotStateCacheEntry&) { return true; }))
+      << "nothing serves more than the minimum";
+  EXPECT_EQ(tier.size(), 4u);
+  EXPECT_EQ(tier.longestPrefix(cache::fromTokens({9}), true), 0u);
 }
