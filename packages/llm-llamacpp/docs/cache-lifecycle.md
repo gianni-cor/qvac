@@ -119,9 +119,11 @@ stateDiagram-v2
     }
 ```
 
-The rule is the same with or without `cacheKey`. Without one nothing reuses
-the state, so the only visible effect is `CacheTokens`, which reports the
-tokens actually decoded.
+The rule is the same with or without `cacheKey`. On text models a request
+without one is reconciled like a keyed one, and its state stays in memory for
+the prefix the next request shares with it (see [Starting from another
+conversation](#starting-from-another-conversation)); it is never written to a
+file.
 
 ## Reconciling the new prompt with the resident ledger
 
@@ -184,6 +186,60 @@ single-prompt and batch paths alike.
 
 After every divergence, checkpoints that are no longer a prefix of the new
 prompt are deleted.
+
+## Starting from another conversation
+
+A request is not limited to the state of its own `cacheKey`. On text models,
+once its prompt is rendered and tokenized and before it is reconciled, the
+addon looks for the state that serves the most of it, wherever that state is
+kept:
+
+1. the request's own sequence: its key's conversation, or what the previous
+   occupant left there (a conversation set aside by a key switch, a request
+   without a key, a conversation evicted from the slot);
+2. on the batch path, the conversation parked in any other free slot;
+3. the RAM tier (`cache_ram_mib`);
+4. the `cacheKey` files this model has used in this process.
+
+A state serves the prefix it shares with the prompt where its memory can be
+trimmed there. On a full-state model, and for another conversation's state on
+a sliding-window model (its window cannot be checked before it is copied), a
+state serves only when it is a prefix of the prompt, or else as far as its
+longest checkpoint within the shared prefix. The longest wins; on a tie the
+earlier source above wins, the one cheapest to bring in. Any shared prefix
+longer than what the request's own sequence serves is used: there is no
+threshold.
+
+The winner is copied into the request's sequence, and the conversation it
+belongs to does not change: a parked slot shares or copies its cells
+(`llama_memory_seq_cp`, as llama-server's `server_slot::copy_state_to` does;
+on hybrid models the recurrent state is copied when the new sequence first
+decodes), a RAM-tier entry is restored from its bytes and stays in the tier,
+and a file is loaded and stays as it was. The request is then reconciled as
+above, so a longer copy is trimmed, or cut back to its checkpoint, to the
+shared prefix. This is llama-server's slot selection by prompt similarity
+(`--slot-prompt-similarity`) and its host-memory prompt cache (`--cache-ram`),
+with any shared prefix taken and the source left where it is.
+
+- **The copy belongs to the request.** Its state is its own key's (or
+  anonymous): the first write of its key writes the whole state to its own
+  file. A request that fails rolls back like any other.
+- **Requests without a key** keep their state in memory: in sequence 0 on the
+  single-prompt path until the next request replaces it (copied into the RAM
+  tier, never to be written, when the next key loads a state of its own), and
+  parked anonymously on the batch path. It is never written to a file, and
+  `saveCache` cannot name it.
+- **Files** are candidates once a request or `saveCache()` named their key in
+  this process; the addon does not scan directories. A file is read again when
+  it changes, and a missing or deleted one is skipped. The lookup does not use
+  the checkpoint a file carries, so on a full-state model a file serves only
+  when its whole state is a prefix of the prompt.
+- **Full-state models** take checkpoints at the end of each history, which
+  rarely falls inside the prefix two different conversations share. In
+  practice another conversation serves them when it is a prefix of the new
+  prompt: a system prompt and tools primed with `prefill` serve every new
+  conversation that starts with them.
+- **Multimodal models** keep a key's state to that key for now.
 
 **Cost.** Decoding is paid once per token, because the shared prefix is
 reused. Rendering and tokenizing are not: every cached turn renders and
@@ -486,14 +542,16 @@ One conversation is active at a time, in the context's sequence 0.
    with, based on the request's `cacheKey`:
    - **same key**: nothing is written; the conversation continues in memory;
    - **another key**, or **no key**: the conversation is set aside before the
-     request is served (with no key, it is then cleared). Setting aside goes
-     through these checks in order:
+     request is served. Its memory stays in sequence 0 on text models, so a
+     request whose key has no state of its own, or that has no key, starts
+     from the prefix it shares with it. Setting aside goes through these
+     checks in order:
      1. it was loaded from, or written to, its file and that file (or its
         directory) is now missing or empty: the caller deleted it, so it is
         dropped and nothing is written;
      2. nothing is committed in it (its only request rolled back): dropped;
      3. the RAM tier is on: it moves to RAM, and nothing is written yet;
-     4. it is ephemeral: dropped;
+     4. it is ephemeral: not written;
      5. no request ran on it since its file was last written or loaded, and
         the file is still there: the file is current, so nothing is written;
      6. otherwise its file is written.
@@ -511,9 +569,10 @@ Each of the `parallel` sequences ("slots") holds at most one conversation.
 1. **A request finishes.** Nothing is written. A committed request with a
    `cacheKey` leaves its state in the slot ("resident") for the next request
    on that key, marked as having turns its file does not hold, with the
-   time it was last used and the request's `ephemeral` flag. Requests without
-   a `cacheKey`, and requests that rolled back, leave nothing: their slot is
-   cleared.
+   time it was last used and the request's `ephemeral` flag. A text request
+   without a `cacheKey` parks its state anonymously: kept for the prefix later
+   requests share with it, ephemeral, never written. Requests that rolled back
+   leave nothing: their slot is cleared.
 2. **A request picks a slot**: the free slot already holding its key's
    conversation (nothing is read); otherwise an empty slot, filled from the RAM
    tier, else from the file, else cold; otherwise the free slot whose resident
@@ -528,8 +587,10 @@ Each of the `parallel` sequences ("slots") holds at most one conversation.
    3. it has unsaved turns and is not ephemeral: its file is written;
       otherwise it is dropped.
 
-   Then the slot is cleared. If it did not go to RAM, its checkpoints are kept
-   in memory per `cacheKey` for its next load.
+   Then the slot is cleared, except when it was taken for a new request on a
+   text model: its cells then stay for the prefix that request shares with
+   them. If it did not go to RAM, its checkpoints are kept in memory per
+   `cacheKey` for its next load.
 4. **The RAM tier is full.** To fit a new entry, the oldest entries are
    removed; each one with unsaved turns that is not ephemeral is written to
    its file first.
@@ -603,6 +664,10 @@ stateDiagram-v2
 - Every source is validated like a file load before it is used: the ledger
   must match the memory it describes, or the state is dropped and the next
   source is tried.
+- A request whose key has no state, or no key, may start from a copy of
+  another slot's parked conversation (see [Starting from another
+  conversation](#starting-from-another-conversation)); the parked one stays
+  as it is.
 - The batch entry wipe of stale single-prompt state skips resident
   conversations. A direct C++ call to the internal single-prompt context
   (not reachable from `run()` on a parallel model) first evicts whatever is

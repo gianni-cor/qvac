@@ -31,6 +31,14 @@ A cached conversation is written to its file by `model.saveCache(cacheKey)`,
 or automatically when it would otherwise be lost; see [Save the cache to
 disk](#save-the-cache-to-disk).
 
+On text models a request also reuses the prompt prefix it shares with any
+other conversation the model holds, whatever its `cacheKey`: the one in
+memory, the [RAM tier](#keep-switched-away-conversations-in-ram), or a
+`cacheKey` file used in this process. A new chat with the same system prompt
+and tools as an earlier one decodes only what follows them. The other
+conversation is copied, never changed. See [Starting from another
+conversation](./cache-lifecycle.md#starting-from-another-conversation).
+
 ## runOptions reference
 
 | Option | Type | Description |
@@ -236,7 +244,12 @@ as the single-prompt path: the conversation stays in memory between requests.
   switches keys), or dropped if it is ephemeral. Its next request restores it
   from wherever it went.
 - A conversation whose loaded `cacheKey` file is deleted is dropped, as on the
-  single-prompt path. Requests without a `cacheKey` are never kept.
+  single-prompt path.
+- **Shared prefixes.** A request whose key has no state of its own, or that
+  has no key, starts from a copy of the conversation that shares the most of
+  its prompt: parked in another slot, in the RAM tier, or in a `cacheKey`
+  file. On text models a request without a `cacheKey` is kept in its slot for
+  that purpose, never written.
 
 Resident conversations with unsaved turns are written to their files when
 the model is reloaded (finetuning reloads it) or unloaded, except ephemeral
@@ -429,7 +442,7 @@ same key without `ephemeral` makes it a normal conversation again.
 
 ## Switch between cache files
 
-On the single-prompt path, passing a different `cacheKey` saves the old conversation to its file if it has unsaved turns (moves it into the RAM tier when that is on, or drops it when it is ephemeral), then loads the new one.
+On the single-prompt path, passing a different `cacheKey` saves the old conversation to its file if it has unsaved turns (moves it into the RAM tier when that is on, or does not write it when it is ephemeral), then loads the new one. A new key without a file starts from the prefix it shares with the old conversation.
 
 ```js
 await model.run([{ role: 'user', content: 'Topic A' }], { cacheKey: 'session1.bin' })
@@ -440,13 +453,16 @@ await model.run([{ role: 'user', content: 'Topic B' }], { cacheKey: 'session2.bi
 
 ## Single-shot inference (no caching)
 
-Omit `cacheKey`. No cache is used and the context is reset after each call.
+Omit `cacheKey`. Nothing is written to a file. On text models the request
+still reuses the prefix it shares with what the model holds, and its state
+stays in memory for the next request, as llama-server does; on multimodal
+models the context is reset after each call.
 
 ```js
 await model.run([{ role: 'user', content: 'One-off question' }])
 ```
 
-If caching was previously active, omitting `cacheKey` saves the active conversation to its file (unless it is ephemeral or has no unsaved turns) and clears it.
+If caching was previously active, omitting `cacheKey` saves the active conversation to its file (unless it is ephemeral or has no unsaved turns) and sets it aside.
 
 ## Tools and reasoning
 
