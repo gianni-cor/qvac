@@ -110,6 +110,12 @@ function assertFollowUpReusesCache(t, firstStats, followUpStats) {
   )
 }
 
+// Tokens a request found already in memory: what the cache holds beyond what
+// it decoded.
+function reusedTokens(stats) {
+  return stats.CacheTokens - stats.promptTokens - stats.generatedTokens
+}
+
 function buildLongPrefillPrompt() {
   return [
     SYSTEM_MESSAGE,
@@ -238,12 +244,12 @@ async function runWithPrefillCancellation(model, prompt, runOptions, cancelViaRe
   return normalizeStats(response.stats, { _chunkCount: 0, _cancelRequested: cancelRequested })
 }
 
-safeTest('CacheTokens remain zero without cacheKey', { timeout: 600_000 }, async (t) => {
+safeTest('A prompt without cacheKey keeps its state in memory', { timeout: 600_000 }, async (t) => {
   const { model } = await setupModel(t)
   const stats = await runAndCollectStats(model, buildPrompt())
-  t.is(stats.CacheTokens, 0)
-  t.ok(stats.promptTokens > 0, 'prompt tokens tracked even without caching')
-  t.ok(stats.generatedTokens > 0, 'generated tokens tracked even without caching')
+  assertCacheMatchesTokens(t, stats, 'the context holds the prompt and the answer')
+  t.ok(stats.promptTokens > 0, 'prompt tokens tracked without a cacheKey')
+  t.ok(stats.generatedTokens > 0, 'generated tokens tracked without a cacheKey')
 })
 
 safeTest('cacheKey stores tokens but stays under n_predict', { timeout: 600_000 }, async (t) => {
@@ -388,7 +394,7 @@ safeTest(
 )
 
 safeTest(
-  'Cache cleared when prompt without cacheKey follows cached inference',
+  'A prompt without cacheKey after a cached one reuses its prefix',
   { timeout: 600_000 },
   async (t) => {
     const { model, dirPath } = await setupModel(t, { n_predict: '256', ctx_size: '4096' })
@@ -399,10 +405,9 @@ safeTest(
     const initialCacheTokens = cachedStats.CacheTokens
 
     const noCacheStats = await runAndCollectStats(model, buildPrompt())
-    t.is(
-      noCacheStats.CacheTokens,
-      0,
-      'prompt without cacheKey clears cache and has zero CacheTokens'
+    t.ok(
+      reusedTokens(noCacheStats) > 0,
+      `prompt without cacheKey reused ${reusedTokens(noCacheStats)} tokens of the cached one`
     )
     t.ok(noCacheStats.promptTokens > 0, 'prompt tokens tracked in single-shot inference')
     t.ok(noCacheStats.generatedTokens > 0, 'generated tokens tracked in single-shot inference')
@@ -417,7 +422,7 @@ safeTest(
   }
 )
 
-safeTest('Cache cleared when switching to different cacheKey', { timeout: 600_000 }, async (t) => {
+safeTest('Switching cacheKey keeps each conversation', { timeout: 600_000 }, async (t) => {
   const { model, dirPath } = await setupModel(t, { n_predict: '256', ctx_size: '4096' })
   const session1 = path.join(dirPath, 'cache-switch-1.bin')
   const session2 = path.join(dirPath, 'cache-switch-2.bin')
@@ -428,6 +433,10 @@ safeTest('Cache cleared when switching to different cacheKey', { timeout: 600_00
 
   const secondStats = await runAndCollectStats(model, buildPrompt(), cacheOpts(session2))
   t.ok(secondStats.CacheTokens > 0, 'second cache session has CacheTokens')
+  t.ok(
+    reusedTokens(secondStats) > 0,
+    `the new cacheKey reused ${reusedTokens(secondStats)} tokens of the first conversation`
+  )
 
   const backToFirstStats = await runAndCollectStats(
     model,
@@ -438,26 +447,22 @@ safeTest('Cache cleared when switching to different cacheKey', { timeout: 600_00
   assertFollowUpReusesCache(t, { CacheTokens: firstCacheInitial }, backToFirstStats)
 })
 
-safeTest(
-  'Single-shot inference resets cache tokens after each non-cached prompt',
-  { timeout: 600_000 },
-  async (t) => {
-    const { model } = await setupModel(t, { n_predict: '256', ctx_size: '4096' })
+safeTest('Single-shot inferences reuse the prefix they share', { timeout: 600_000 }, async (t) => {
+  const { model } = await setupModel(t, { n_predict: '256', ctx_size: '4096' })
 
-    const stats1 = await runAndCollectStats(model, buildPrompt())
-    t.is(stats1.CacheTokens, 0, 'first single-shot inference has zero CacheTokens')
-    t.ok(stats1.promptTokens > 0, 'prompt tokens tracked')
-    t.ok(stats1.generatedTokens > 0, 'generated tokens tracked')
+  const stats1 = await runAndCollectStats(model, buildPrompt())
+  t.is(reusedTokens(stats1), 0, 'first single-shot inference starts cold')
+  t.ok(stats1.promptTokens > 0, 'prompt tokens tracked')
+  t.ok(stats1.generatedTokens > 0, 'generated tokens tracked')
 
-    const stats2 = await runAndCollectStats(model, buildPrompt())
-    t.is(stats2.CacheTokens, 0, 'second single-shot inference also has zero CacheTokens')
-    t.ok(stats2.promptTokens > 0, 'prompt tokens tracked in second inference')
-    t.ok(stats2.generatedTokens > 0, 'generated tokens tracked in second inference')
+  const stats2 = await runAndCollectStats(model, buildPrompt())
+  t.ok(reusedTokens(stats2) > 0, 'second single-shot inference reuses the first one')
+  t.ok(stats2.promptTokens > 0, 'prompt tokens tracked in second inference')
+  t.ok(stats2.generatedTokens > 0, 'generated tokens tracked in second inference')
 
-    const stats3 = await runAndCollectStats(model, buildPrompt())
-    t.is(stats3.CacheTokens, 0, 'third single-shot inference also has zero CacheTokens')
-  }
-)
+  const stats3 = await runAndCollectStats(model, buildPrompt())
+  t.ok(reusedTokens(stats3) > 0, 'third single-shot inference reuses the second one')
+})
 
 safeTest(
   'Cache to no-cache to cache transition works correctly',
@@ -471,7 +476,7 @@ safeTest(
     const initialCacheTokens = cachedStats.CacheTokens
 
     const noCacheStats = await runAndCollectStats(model, buildPrompt())
-    t.is(noCacheStats.CacheTokens, 0, 'no-cache inference clears cache and has zero CacheTokens')
+    t.ok(reusedTokens(noCacheStats) > 0, 'no-cache inference reuses the cached prefix')
 
     const reCachedStats = await runAndCollectStats(
       model,

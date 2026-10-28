@@ -385,6 +385,10 @@ private:
     /// The RAM tier itself, shared by the single-prompt cache and the batch
     /// scheduler.
     std::shared_ptr<batching::SlotStateCache> ramTier_;
+    /// cacheKey files this model has used, shared by the single-prompt cache
+    /// and the batch scheduler as places to start a request from.
+    std::shared_ptr<qvac_lib_inference_addon_llama::cache::CacheFileIndex>
+        fileIndex_;
 
     // configuration values parsed from configFilemap
     std::optional<load_fit_normalization::NormalizedFitSnapshot>
